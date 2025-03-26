@@ -5,6 +5,7 @@ use std::ops::{Div, Sub};
 #[cfg(feature = "hf-hub")]
 use std::{fs::read_to_string, path::Path};
 
+// Represents the data being transformed, can be image or ndarray
 pub enum TransformData {
     Image(DynamicImage),
     NdArray(Array3<f32>),
@@ -14,108 +15,183 @@ impl TransformData {
     pub fn image(self) -> anyhow::Result<DynamicImage> {
         match self {
             TransformData::Image(img) => Ok(img),
-            _ => Err(anyhow!("TransformData convert error")),
+            _ => Err(anyhow!(
+                "TransformData type error: Expected Image, found NdArray"
+            )),
         }
     }
 
     pub fn array(self) -> anyhow::Result<Array3<f32>> {
         match self {
             TransformData::NdArray(array) => Ok(array),
-            _ => Err(anyhow!("TransformData convert error")),
+            _ => Err(anyhow!(
+                "TransformData type error: Expected NdArray, found Image"
+            )),
         }
     }
 }
 
+// Trait for any image transformation step
 pub trait Transform: Send + Sync {
-    fn transform(&self, images: TransformData) -> anyhow::Result<TransformData>;
+    fn transform(&self, data: TransformData) -> anyhow::Result<TransformData>;
 }
 
-struct ConvertToRGB;
+// --- Individual Transforms ---
 
+struct ConvertToRGB;
 impl Transform for ConvertToRGB {
     fn transform(&self, data: TransformData) -> anyhow::Result<TransformData> {
         let image = data.image()?;
+        // Ensure image is RGB8 for consistency
         let image = image.into_rgb8().into();
         Ok(TransformData::Image(image))
     }
 }
 
+// Enum to define the resizing intent based on config
+#[derive(Debug, Clone, Copy)]
+enum ResizeIntent {
+    ShortestEdge(u32),
+    Exact { width: u32, height: u32 },
+}
+
+// Resize struct now holds the intent and resample filter
 pub struct Resize {
-    pub size: (u32, u32),
-    pub resample: FilterType,
+    intent: ResizeIntent,
+    resample: FilterType,
+}
+
+// Helper function to calculate output size maintaining aspect ratio
+fn calculate_aspect_ratio_size(
+    current_width: u32,
+    current_height: u32,
+    target_shortest_edge: u32,
+) -> (u32, u32) {
+    if current_width == 0 || current_height == 0 {
+        return (0, 0); // Avoid division by zero
+    }
+
+    let scale = if current_width < current_height {
+        target_shortest_edge as f64 / current_width as f64
+    } else {
+        target_shortest_edge as f64 / current_height as f64
+    };
+
+    let new_width = (current_width as f64 * scale).round() as u32;
+    let new_height = (current_height as f64 * scale).round() as u32;
+
+    (new_width, new_height)
 }
 
 impl Transform for Resize {
     fn transform(&self, data: TransformData) -> anyhow::Result<TransformData> {
         let image = data.image()?;
-        let image = image.resize_exact(self.size.0, self.size.1, self.resample);
-        Ok(TransformData::Image(image))
-    }
-}
+        let (current_width, current_height) = image.dimensions();
 
-pub struct CenterCrop {
-    pub size: (u32, u32),
-}
+        // Calculate the final output dimensions based on the intent
+        let (output_width, output_height) = match self.intent {
+            ResizeIntent::ShortestEdge(edge) => {
+                calculate_aspect_ratio_size(current_width, current_height, edge)
+            }
+            ResizeIntent::Exact { width, height } => (width, height),
+        };
 
-impl Transform for CenterCrop {
-    fn transform(&self, data: TransformData) -> anyhow::Result<TransformData> {
-        let mut image = data.image()?;
-        let (mut origin_width, mut origin_height) = image.dimensions();
-        let (crop_width, crop_height) = self.size;
-        if origin_width >= crop_width && origin_height >= crop_height {
-            // cropped area is within image boundaries
-            let x = (origin_width - crop_width) / 2;
-            let y = (origin_height - crop_height) / 2;
-            let image = image.crop_imm(x, y, crop_width, crop_height);
-            Ok(TransformData::Image(image))
+        // Perform the actual resize ONLY if dimensions change and are valid
+        if output_width > 0
+            && output_height > 0
+            && (output_width != current_width || output_height != current_height)
+        {
+            println!(
+                "Resizing from ({}, {}) to ({}, {}) using {:?}",
+                current_width, current_height, output_width, output_height, self.resample
+            );
+            let resized_image = image.resize_exact(output_width, output_height, self.resample);
+            Ok(TransformData::Image(resized_image))
         } else {
-            if origin_width > crop_width || origin_height > crop_height {
-                let (new_width, new_height) =
-                    (origin_width.min(crop_width), origin_height.min(crop_height));
-                let (x, y) = if origin_width > crop_width {
-                    ((origin_width - crop_width) / 2, 0)
-                } else {
-                    (0, (origin_height - crop_height) / 2)
-                };
-                image = image.crop_imm(x, y, new_width, new_height);
-                (origin_width, origin_height) = image.dimensions();
-            }
-            let mut pixels_array =
-                Array3::zeros((3usize, crop_width as usize, crop_height as usize));
-            let offset_x = (crop_width - origin_width) / 2;
-            let offset_y = (crop_height - origin_height) / 2;
-            // whc -> chw
-            for (x, y, pixel) in image.to_rgb8().enumerate_pixels() {
-                pixels_array[[0, (y + offset_y) as usize, (x + offset_x) as usize]] =
-                    pixel[0] as f32;
-                pixels_array[[1, (y + offset_y) as usize, (x + offset_x) as usize]] =
-                    pixel[1] as f32;
-                pixels_array[[2, (y + offset_y) as usize, (x + offset_x) as usize]] =
-                    pixel[2] as f32;
-            }
-            Ok(TransformData::NdArray(pixels_array))
+            println!(
+                "Skipping resize or invalid dimensions: current=({}, {}), target=({}, {})",
+                current_width, current_height, output_width, output_height
+            );
+            Ok(TransformData::Image(image)) // Return original if no resize needed or invalid target
         }
     }
 }
 
-struct PILToNDarray;
+pub struct CenterCrop {
+    // Store as width, height consistent with image crate
+    size: (u32, u32),
+}
 
-impl Transform for PILToNDarray {
+impl Transform for CenterCrop {
+    fn transform(&self, data: TransformData) -> anyhow::Result<TransformData> {
+        let image = data.image()?; // Expects image data before cropping
+        let (origin_width, origin_height) = image.dimensions();
+        let (crop_width, crop_height) = self.size;
+
+        // Ensure crop dimensions are valid
+        if crop_width == 0 || crop_height == 0 {
+            return Err(anyhow!(
+                "CenterCrop size cannot be zero: width={}, height={}",
+                crop_width,
+                crop_height
+            ));
+        }
+
+        // Check if crop is possible within image bounds
+        if crop_width > origin_width || crop_height > origin_height {
+            // This case should ideally not happen if resize preceded crop correctly,
+            // but handle defensively (or error out)
+            eprintln!(
+                 "Warning: Crop size ({}, {}) larger than image size ({}, {}). Cropping maximum possible area.",
+                 crop_width, crop_height, origin_width, origin_height
+             );
+            // Optionally, you could resize first, or error here depending on desired behavior
+            // For now, let's proceed but the result might not be what CLIP expects
+            // We might need padding logic here if the spec requires it, but Python likely errors.
+        }
+
+        // Calculate top-left corner using integer division (flooring)
+        let x = (origin_width.saturating_sub(crop_width)) / 2;
+        let y = (origin_height.saturating_sub(crop_height)) / 2;
+
+        println!(
+            "Center Cropping image ({}, {}) to ({}, {}) starting at ({}, {})",
+            origin_width, origin_height, crop_width, crop_height, x, y
+        );
+
+        // Crop (immutable version)
+        let cropped_image = image.crop_imm(
+            x,
+            y,
+            crop_width.min(origin_width),
+            crop_height.min(origin_height),
+        ); // Use min to avoid panic if warning above occurred
+        Ok(TransformData::Image(cropped_image))
+        // Note: Removed the complex padding logic from the original snippet,
+        // assuming the standard CLIP process resizes *then* crops within bounds.
+    }
+}
+
+// Converts the DynamicImage to ndarray format (C, H, W)
+struct ImageToNdarray;
+impl Transform for ImageToNdarray {
     fn transform(&self, data: TransformData) -> anyhow::Result<TransformData> {
         match data {
             TransformData::Image(image) => {
-                let image = image.to_rgb8();
+                let image = image.to_rgb8(); // Ensure RGB8
                 let (width, height) = image.dimensions();
-                // whc -> chw
                 let mut pixels_array = Array3::zeros((3usize, height as usize, width as usize));
+
                 for (x, y, pixel) in image.enumerate_pixels() {
-                    pixels_array[[0, y as usize, x as usize]] = pixel[0] as f32;
-                    pixels_array[[1, y as usize, x as usize]] = pixel[1] as f32;
+                    // Pixel is image::Rgb([u8; 3])
+                    pixels_array[[0, y as usize, x as usize]] = pixel[0] as f32; // R
+                    pixels_array[[1, y as usize, x as usize]] = pixel[1] as f32; // G
                     pixels_array[[2, y as usize, x as usize]] = pixel[2] as f32;
+                    // B
                 }
                 Ok(TransformData::NdArray(pixels_array))
             }
-            ndarray => Ok(ndarray),
+            TransformData::NdArray(array) => Ok(TransformData::NdArray(array)), // Pass through if already array
         }
     }
 }
@@ -123,11 +199,10 @@ impl Transform for PILToNDarray {
 pub struct Rescale {
     pub scale: f32,
 }
-
 impl Transform for Rescale {
     fn transform(&self, data: TransformData) -> anyhow::Result<TransformData> {
         let array = data.array()?;
-        let array = array * self.scale;
+        let array = array * self.scale; // Element-wise multiplication
         Ok(TransformData::NdArray(array))
     }
 }
@@ -136,31 +211,30 @@ pub struct Normalize {
     pub mean: Vec<f32>,
     pub std: Vec<f32>,
 }
-
 impl Transform for Normalize {
     fn transform(&self, data: TransformData) -> anyhow::Result<TransformData> {
         let array = data.array()?;
-        let mean = Array::from_vec(self.mean.clone())
-            .into_shape_with_order((3, 1, 1))
-            .unwrap();
-        let std = Array::from_vec(self.std.clone())
-            .into_shape_with_order((3, 1, 1))
-            .unwrap();
-
-        let shape = array.shape().to_vec();
-        match shape.as_slice() {
-            [c, h, w] => {
-                let array_normalized = array
-                    .sub(mean.broadcast((*c, *h, *w)).unwrap())
-                    .div(std.broadcast((*c, *h, *w)).unwrap());
-                Ok(TransformData::NdArray(array_normalized))
-            }
-            _ => Err(anyhow!(
-                "Transformer convert error. Normlize operator get error shape."
-            )),
+        // Ensure mean/std vectors are valid
+        if self.mean.len() != 3 || self.std.len() != 3 {
+            return Err(anyhow!(
+                "Normalize mean and std must have length 3, got mean={}, std={}",
+                self.mean.len(),
+                self.std.len()
+            ));
         }
+        // Reshape mean and std for broadcasting (C, 1, 1)
+        let mean_arr = Array::from_shape_vec((3, 1, 1), self.mean.clone())?;
+        let std_arr = Array::from_shape_vec((3, 1, 1), self.std.clone())?;
+
+        // Check if broadcasting is possible (implicitly handled by ndarray op)
+        // let array_normalized = (array - &mean_arr) / &std_arr; // More concise
+        let array_normalized = array.sub(&mean_arr).div(&std_arr);
+
+        Ok(TransformData::NdArray(array_normalized))
     }
 }
+
+// --- Composition and Loading ---
 
 pub struct Compose {
     transforms: Vec<Box<dyn Transform>>,
@@ -178,188 +252,165 @@ impl Compose {
         load_preprocessor(config)
     }
 
+    // Load config directly from bytes (e.g., embedded resource)
     pub fn from_bytes<P: AsRef<[u8]>>(bytes: P) -> anyhow::Result<Compose> {
         let config = serde_json::from_slice(bytes.as_ref())?;
         load_preprocessor(config)
     }
 }
 
+// Apply the sequence of transforms
 impl Transform for Compose {
-    fn transform(&self, mut image: TransformData) -> anyhow::Result<TransformData> {
+    fn transform(&self, mut data: TransformData) -> anyhow::Result<TransformData> {
         for transform in &self.transforms {
-            image = transform.transform(image)?;
+            data = transform.transform(data)?;
         }
-        Ok(image)
+        Ok(data)
     }
 }
 
+// Function to load the pipeline from JSON config
 fn load_preprocessor(config: serde_json::Value) -> anyhow::Result<Compose> {
     let mut transformers: Vec<Box<dyn Transform>> = vec![];
-    transformers.push(Box::new(ConvertToRGB));
+
+    // 1. Convert to RGB (Always done first for consistency)
+    if config["do_convert_rgb"].as_bool().unwrap_or(true) {
+        transformers.push(Box::new(ConvertToRGB));
+    }
 
     let mode = config["image_processor_type"]
         .as_str()
-        .unwrap_or("CLIPImageProcessor");
+        .ok_or_else(|| anyhow!("'image_processor_type' not found or not a string in config"))?;
+
     match mode {
         "CLIPImageProcessor" => {
-            if config["do_resize"].as_bool().unwrap_or(false) {
-                let size = config["size"].clone();
-                let shortest_edge = size["shortest_edge"].as_u64();
-                let (height, width) = (size["height"].as_u64(), size["width"].as_u64());
+            // 2. Resize
+            if config["do_resize"].as_bool().unwrap_or(true) {
+                // Default true for CLIP
+                let size_config = config["size"].clone();
+                if size_config.is_null() {
+                    return Err(anyhow!("'size' configuration is missing for resize"));
+                }
 
-                if let Some(shortest_edge) = shortest_edge {
-                    let size = (shortest_edge as u32, shortest_edge as u32);
-                    transformers.push(Box::new(Resize {
-                        size,
-                        resample: FilterType::CatmullRom,
-                    }));
-                } else if let (Some(height), Some(width)) = (height, width) {
-                    let size = (height as u32, width as u32);
-                    transformers.push(Box::new(Resize {
-                        size,
-                        resample: FilterType::CatmullRom,
-                    }));
+                let resize_intent = if let Some(edge) = size_config["shortest_edge"].as_u64() {
+                    ResizeIntent::ShortestEdge(edge as u32)
+                } else if let (Some(h), Some(w)) = (
+                    size_config["height"].as_u64(),
+                    size_config["width"].as_u64(),
+                ) {
+                    ResizeIntent::Exact {
+                        width: w as u32,
+                        height: h as u32,
+                    }
                 } else {
                     return Err(anyhow!(
-                        "Size must contain either 'shortest_edge' or 'height' and 'width'."
+                        "'size' must contain either 'shortest_edge' or both 'height' and 'width'."
+                    ));
+                };
+
+                // Read and Map Resample Filter
+                let resample_value = config["resample"].as_u64().unwrap_or(3); // Default 3 (Bicubic)
+                                                                               // println!("Config requests resample value: {}", resample_value); // Debugging
+
+                let filter_type = match resample_value {
+                    0 => FilterType::Nearest,
+                    1 => FilterType::Lanczos3,
+                    2 => FilterType::Triangle, // Bilinear in Pillow
+                    // *** Mapping 3 (Bicubic) to CatmullRom ***
+                    // This is the closest cubic filter in `image` crate, but NOT identical to Pillow's Bicubic.
+                    3 => FilterType::CatmullRom,
+                    4 => FilterType::Gaussian, // Map Box? Gaussian is reasonable default.
+                    5 => FilterType::Lanczos3, // Map Hamming? Lanczos3 is reasonable default.
+                    _ => {
+                        eprintln!(
+                            "Warning: Unknown resample value {}, defaulting to CatmullRom",
+                            resample_value
+                        );
+                        FilterType::CatmullRom // Default fallback
+                    }
+                };
+                // println!("Using FilterType: {:?}", filter_type); // Debugging
+
+                transformers.push(Box::new(Resize {
+                    intent: resize_intent,
+                    resample: filter_type,
+                }));
+            }
+
+            // 3. Center Crop
+            if config["do_center_crop"].as_bool().unwrap_or(true) {
+                // Default true for CLIP
+                let crop_size_config = config["crop_size"].clone();
+                if crop_size_config.is_null() {
+                    return Err(anyhow!(
+                        "'crop_size' configuration is missing for center_crop"
                     ));
                 }
-            }
 
-            if config["do_center_crop"].as_bool().unwrap_or(false) {
-                let crop_size = config["crop_size"].clone();
-                let (height, width) = if crop_size.is_u64() {
-                    let size = crop_size.as_u64().unwrap() as u32;
-                    (size, size)
-                } else if crop_size.is_object() {
+                // Read crop size (can be single int or object with height/width)
+                let (crop_height, crop_width) = if let Some(size) = crop_size_config.as_u64() {
+                    (size as u32, size as u32) // Square crop if single int
+                } else if crop_size_config.is_object() {
                     (
-                        crop_size["height"]
+                        crop_size_config["height"]
                             .as_u64()
-                            .map(|height| height as u32)
-                            .ok_or(anyhow!("crop_size height must be cotained"))?,
-                        crop_size["width"]
+                            .map(|h| h as u32)
+                            .ok_or(anyhow!("'crop_size' object missing 'height'"))?,
+                        crop_size_config["width"]
                             .as_u64()
-                            .map(|width| width as u32)
-                            .ok_or(anyhow!("crop_size width must be cotained"))?,
+                            .map(|w| w as u32)
+                            .ok_or(anyhow!("'crop_size' object missing 'width'"))?,
                     )
-                } else {
-                    return Err(anyhow!("Invalid crop size: {:?}", crop_size));
-                };
-                transformers.push(Box::new(CenterCrop {
-                    size: (width, height),
-                }));
-            }
-        }
-        "ConvNextFeatureExtractor" => {
-            let shortest_edge = config["size"]["shortest_edge"].as_u64();
-            if shortest_edge.is_none() {
-                return Err(anyhow!("Size dictionary must contain 'shortest_edge' key."));
-            }
-            let shortest_edge = shortest_edge.unwrap() as u32;
-            let crop_pct = config["crop_pct"].as_f64().unwrap_or(0.875);
-            if shortest_edge < 384 {
-                let resize_shortet_edge = shortest_edge as f64 / crop_pct;
-                transformers.push(Box::new(Resize {
-                    size: (resize_shortet_edge as u32, resize_shortet_edge as u32),
-                    resample: FilterType::CatmullRom,
-                }));
-                transformers.push(Box::new(CenterCrop {
-                    size: (shortest_edge, shortest_edge),
-                }))
-            } else {
-                transformers.push(Box::new(Resize {
-                    size: (shortest_edge, shortest_edge),
-                    resample: FilterType::CatmullRom,
-                }));
-            }
-        }
-        "BitImageProcessor" => {
-            if config["do_convert_rgb"].as_bool().unwrap_or(false) {
-                transformers.push(Box::new(ConvertToRGB));
-            }
-            if config["do_resize"].as_bool().unwrap_or(false) {
-                let size = config["size"].clone();
-                let shortest_edge = size["shortest_edge"].as_u64();
-                let (height, width) = (size["height"].as_u64(), size["width"].as_u64());
-
-                if let Some(shortest_edge) = shortest_edge {
-                    let size = (shortest_edge as u32, shortest_edge as u32);
-                    transformers.push(Box::new(Resize {
-                        size,
-                        resample: FilterType::CatmullRom,
-                    }));
-                } else if let (Some(height), Some(width)) = (height, width) {
-                    let size = (height as u32, width as u32);
-                    transformers.push(Box::new(Resize {
-                        size,
-                        resample: FilterType::CatmullRom,
-                    }));
                 } else {
                     return Err(anyhow!(
-                        "Size must contain either 'shortest_edge' or 'height' and 'width'."
+                        "Invalid 'crop_size' format: {:?}",
+                        crop_size_config
                     ));
-                }
-            }
-
-            if config["do_center_crop"].as_bool().unwrap_or(false) {
-                let crop_size = config["crop_size"].clone();
-                let (height, width) = if crop_size.is_u64() {
-                    let size = crop_size.as_u64().unwrap() as u32;
-                    (size, size)
-                } else if crop_size.is_object() {
-                    (
-                        crop_size["height"]
-                            .as_u64()
-                            .map(|height| height as u32)
-                            .ok_or(anyhow!("crop_size height must be contained"))?,
-                        crop_size["width"]
-                            .as_u64()
-                            .map(|width| width as u32)
-                            .ok_or(anyhow!("crop_size width must be contained"))?,
-                    )
-                } else {
-                    return Err(anyhow!("Invalid crop size: {:?}", crop_size));
                 };
+
                 transformers.push(Box::new(CenterCrop {
-                    size: (width, height),
+                    // Pass size as (width, height) consistent with image crate
+                    size: (crop_width, crop_height),
                 }));
             }
         }
-        mode => return Err(anyhow!("Preprocessror {} is not supported", mode)),
+        // Add other processor types here if needed ("ConvNextFeatureExtractor", "BitImageProcessor", etc.)
+        // Ensure their resize logic also considers aspect ratio correctly if needed.
+        mode => return Err(anyhow!("Unsupported image_processor_type: {}", mode)),
     }
 
-    transformers.push(Box::new(PILToNDarray));
+    // 4. Convert Image to Ndarray (C, H, W) format for numerical ops
+    transformers.push(Box::new(ImageToNdarray));
 
+    // 5. Rescale pixel values (e.g., 0-255 -> 0-1)
     if config["do_rescale"].as_bool().unwrap_or(true) {
-        let rescale_factor = config["rescale_factor"].as_f64().unwrap_or(1.0f64 / 255.0);
+        // Default true for CLIP
+        let rescale_factor = config["rescale_factor"].as_f64().unwrap_or(1.0 / 255.0); // Default 1/255
         transformers.push(Box::new(Rescale {
             scale: rescale_factor as f32,
         }));
     }
 
-    if config["do_normalize"].as_bool().unwrap_or(false) {
-        let mean = config["image_mean"]
-            .as_array()
-            .ok_or(anyhow!("image_mean must be contained"))?
-            .iter()
-            .map(|value| {
-                value
-                    .as_f64()
-                    .map(|num| num as f32)
-                    .ok_or(anyhow!("image_mean must be float"))
-            })
-            .collect::<Result<Vec<f32>>>()?;
-        let std = config["image_std"]
-            .as_array()
-            .ok_or(anyhow!("image_std must be contained"))?
-            .iter()
-            .map(|value| {
-                value
-                    .as_f64()
-                    .map(|num| num as f32)
-                    .ok_or(anyhow!("image_std must be float"))
-            })
-            .collect::<Result<Vec<f32>>>()?;
+    // 6. Normalize
+    if config["do_normalize"].as_bool().unwrap_or(true) {
+        // Default true for CLIP
+        // Helper to parse float arrays from JSON
+        let parse_float_array = |key: &str| -> Result<Vec<f32>> {
+            config[key]
+                .as_array()
+                .ok_or_else(|| anyhow!("'{}' array is missing or not an array", key))?
+                .iter()
+                .map(|v| {
+                    v.as_f64()
+                        .map(|n| n as f32)
+                        .ok_or_else(|| anyhow!("Non-float value found in '{}' array", key))
+                })
+                .collect()
+        };
+
+        let mean = parse_float_array("image_mean")?;
+        let std = parse_float_array("image_std")?;
+
         transformers.push(Box::new(Normalize { mean, std }));
     }
 
