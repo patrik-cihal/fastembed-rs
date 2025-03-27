@@ -101,17 +101,9 @@ impl Transform for Resize {
             && output_height > 0
             && (output_width != current_width || output_height != current_height)
         {
-            println!(
-                "Resizing from ({}, {}) to ({}, {}) using {:?}",
-                current_width, current_height, output_width, output_height, self.resample
-            );
             let resized_image = image.resize_exact(output_width, output_height, self.resample);
             Ok(TransformData::Image(resized_image))
         } else {
-            println!(
-                "Skipping resize or invalid dimensions: current=({}, {}), target=({}, {})",
-                current_width, current_height, output_width, output_height
-            );
             Ok(TransformData::Image(image)) // Return original if no resize needed or invalid target
         }
     }
@@ -141,10 +133,6 @@ impl Transform for CenterCrop {
         if crop_width > origin_width || crop_height > origin_height {
             // This case should ideally not happen if resize preceded crop correctly,
             // but handle defensively (or error out)
-            eprintln!(
-                 "Warning: Crop size ({}, {}) larger than image size ({}, {}). Cropping maximum possible area.",
-                 crop_width, crop_height, origin_width, origin_height
-             );
             // Optionally, you could resize first, or error here depending on desired behavior
             // For now, let's proceed but the result might not be what CLIP expects
             // We might need padding logic here if the spec requires it, but Python likely errors.
@@ -153,11 +141,6 @@ impl Transform for CenterCrop {
         // Calculate top-left corner using integer division (flooring)
         let x = (origin_width.saturating_sub(crop_width)) / 2;
         let y = (origin_height.saturating_sub(crop_height)) / 2;
-
-        println!(
-            "Center Cropping image ({}, {}) to ({}, {}) starting at ({}, {})",
-            origin_width, origin_height, crop_width, crop_height, x, y
-        );
 
         // Crop (immutable version)
         let cropped_image = image.crop_imm(
